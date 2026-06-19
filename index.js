@@ -39,7 +39,7 @@ async function run() {
     await client.connect();
 
     const database = client.db("fable_db");
-    const usersCollection = database.collection("users");
+    const usersCollection = database.collection("user");
     const ebooksCollection = database.collection("ebooks");
     const transactionsCollection = database.collection("transactions");
 
@@ -569,6 +569,109 @@ async function run() {
         res.status(500).send({
           success: false,
           message: "failed to verify payment",
+          error: err.message,
+        });
+      }
+    });
+
+    // ==========================================
+    // user action: get purchased ebooks
+    // ==========================================
+    app.get("/api/users/purchased-ebooks", async (req, res) => {
+      try {
+        const { email } = req.query;
+
+        if (!email) {
+          return res.status(400).send({ message: "email is required" });
+        }
+
+        const user = await usersCollection.findOne({ email });
+
+        if (!user || !user.purchasedEbooks?.length) {
+          return res.send([]);
+        }
+
+        const purchasedIds = user.purchasedEbooks || [];
+
+        const objectIds = purchasedIds
+          .filter((id) => ObjectId.isValid(id))
+          .map((id) => new ObjectId(id));
+
+        if (objectIds.length === 0) {
+          return res.send([]);
+        }
+
+        const ebooksFromDb = await ebooksCollection
+          .find({ _id: { $in: objectIds } })
+          .project({ fullContent: 0 })
+          .toArray();
+
+        const transactions = await transactionsCollection
+          .find({
+            buyerEmail: email,
+            type: "purchase",
+            status: "paid",
+          })
+          .sort({ createdAt: -1 })
+          .toArray();
+
+        const ebookMap = new Map(
+          ebooksFromDb.map((ebook) => [ebook._id.toString(), ebook])
+        );
+
+        const transactionMap = new Map(
+          transactions.map((item) => [item.ebookId, item])
+        );
+
+        const ebooks = purchasedIds
+          .map((id) => {
+            const ebook = ebookMap.get(id);
+
+            if (!ebook) return null;
+
+            const transaction = transactionMap.get(id);
+
+            return {
+              ...ebook,
+              purchaseDate: transaction?.purchaseDate || transaction?.createdAt,
+              transactionId: transaction?.transactionId || "",
+            };
+          })
+          .filter(Boolean)
+          .reverse();
+
+        res.send(ebooks);
+      } catch (err) {
+        res.status(500).send({
+          message: "failed to load purchased ebooks",
+          error: err.message,
+        });
+      }
+    });
+
+    // ==========================================
+    // user action: get purchase history
+    // ==========================================
+    app.get("/api/users/purchase-history", async (req, res) => {
+      try {
+        const { email } = req.query;
+
+        if (!email) {
+          return res.status(400).send({ message: "email is required" });
+        }
+
+        const transactions = await transactionsCollection
+          .find({
+            buyerEmail: email,
+            type: "purchase",
+          })
+          .sort({ createdAt: -1 })
+          .toArray();
+
+        res.send(transactions);
+      } catch (err) {
+        res.status(500).send({
+          message: "failed to load purchase history",
           error: err.message,
         });
       }
