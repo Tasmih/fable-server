@@ -11,6 +11,12 @@ const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 const app = express();
 const port = process.env.PORT || 5000;
 
+// stripe setup
+// this is used for ebook purchase payment
+const stripe = process.env.STRIPE_SECRET_KEY
+  ? require("stripe")(process.env.STRIPE_SECRET_KEY)
+  : null;
+
 app.use(cors());
 app.use(express.json());
 
@@ -207,6 +213,7 @@ async function run() {
     app.get("/api/ebooks/:id", async (req, res) => {
       try {
         const id = req.params.id;
+        const { email } = req.query;
 
         if (!ObjectId.isValid(id)) {
           return res.status(400).send({ message: "invalid ebook id" });
@@ -220,7 +227,40 @@ async function run() {
           return res.status(404).send({ message: "ebook not found" });
         }
 
-        res.send(ebook);
+        let hasPurchased = false;
+        let hasBookmarked = false;
+        let isWriter = false;
+
+        if (email) {
+          const user = await usersCollection.findOne({ email });
+
+          hasPurchased = user?.purchasedEbooks?.includes(id) || false;
+          hasBookmarked = user?.bookmarks?.includes(id) || false;
+          isWriter = ebook.writerEmail === email;
+        }
+
+        const canReadFullContent = hasPurchased || isWriter;
+
+        // public users can see preview, but full content will be hidden
+        if (!canReadFullContent) {
+          const { fullContent, ...publicData } = ebook;
+
+          return res.send({
+            ...publicData,
+            hasPurchased,
+            hasBookmarked,
+            isWriter,
+            canReadFullContent: false,
+          });
+        }
+
+        res.send({
+          ...ebook,
+          hasPurchased,
+          hasBookmarked,
+          isWriter,
+          canReadFullContent: true,
+        });
       } catch (err) {
         res.status(500).send({
           message: "failed to load ebook",
@@ -230,44 +270,383 @@ async function run() {
     });
 
     // ==========================================
+    // client action: add ebook to bookmark
+    // ==========================================
+    app.post("/api/users/bookmark/:ebookId", async (req, res) => {
+      try {
+        const { ebookId } = req.params;
+        const { email } = req.query;
+
+        if (!email) {
+          return res.status(400).send({ message: "email is required" });
+        }
+
+        const result = await usersCollection.updateOne(
+          { email },
+          { $addToSet: { bookmarks: ebookId } }
+        );
+
+        res.send({
+          success: true,
+          message: "ebook bookmarked",
+          result,
+        });
+      } catch (err) {
+        res.status(500).send({
+          message: "failed to bookmark ebook",
+          error: err.message,
+        });
+      }
+    });
+
+    // ==========================================
+    // client action: remove ebook from bookmark
+    // ==========================================
+    app.delete("/api/users/bookmark/:ebookId", async (req, res) => {
+      try {
+        const { ebookId } = req.params;
+        const { email } = req.query;
+
+        if (!email) {
+          return res.status(400).send({ message: "email is required" });
+        }
+
+        const result = await usersCollection.updateOne(
+          { email },
+          { $pull: { bookmarks: ebookId } }
+        );
+
+        res.send({
+          success: true,
+          message: "bookmark removed",
+          result,
+        });
+      } catch (err) {
+        res.status(500).send({
+          message: "failed to remove bookmark",
+          error: err.message,
+        });
+      }
+    });
+
+    // ==========================================
+    // payment action: create stripe checkout session
+    // ==========================================
+    app.post("/api/payment/create-checkout", async (req, res) => {
+      try {
+        if (!stripe) {
+          return res.status(500).send({
+            message: "stripe secret key is missing",
+          });
+        }
+
+        const { ebookId, userEmail } = req.body;
+
+        if (!ebookId || !userEmail) {
+          return res.status(400).send({
+            message: "ebookId and userEmail are required",
+          });
+        }
+
+        if (!ObjectId.isValid(ebookId)) {
+          return res.status(400).send({ message: "invalid ebook id" });
+        }
+
+        const ebook = await ebooksCollection.findOne({
+          _id: new ObjectId(ebookId),
+        });
+
+        if (!ebook) {
+          return res.status(404).send({ message: "ebook not found" });
+        }
+
+        // writer cannot buy own ebook
+        if (ebook.writerEmail === userEmail) {
+          return res.status(400).send({
+            message: "you cannot purchase your own ebook",
+          });
+        }
+
+        const user = await usersCollection.findOne({ email: userEmail });
+
+        if (user?.purchasedEbooks?.includes(ebookId)) {
+          return res.status(400).send({
+            message: "already purchased",
+          });
+        }
+
+        const session = await stripe.checkout.sessions.create({
+          payment_method_types: ["card"],
+          line_items: [
+            {
+              price_data: {
+                currency: "usd",
+                product_data: {
+                  name: ebook.title,
+                  images: ebook.coverImage ? [ebook.coverImage] : [],
+                },
+                unit_amount: Math.round(Number(ebook.price) * 100),
+              },
+              quantity: 1,
+            },
+          ],
+          mode: "payment",
+          success_url: `${process.env.CLIENT_URL}/payment/success?session_id={CHECKOUT_SESSION_ID}`,
+          cancel_url: `${process.env.CLIENT_URL}/ebooks/${ebookId}`,
+          metadata: {
+            ebookId,
+            userEmail,
+            writerEmail: ebook.writerEmail,
+          },
+        });
+
+        res.send({ url: session.url });
+      } catch (err) {
+        res.status(500).send({
+          message: "failed to create checkout session",
+          error: err.message,
+        });
+      }
+    });
+
+    // ==========================================
+    // payment action: verify stripe payment and save purchase
+    // ==========================================
+    app.get("/api/payment/success", async (req, res) => {
+      try {
+        if (!stripe) {
+          return res.status(500).send({
+            success: false,
+            message: "stripe secret key is missing",
+          });
+        }
+
+        const { session_id } = req.query;
+
+        if (!session_id) {
+          return res.status(400).send({
+            success: false,
+            message: "session id is required",
+          });
+        }
+
+        const checkoutSession = await stripe.checkout.sessions.retrieve(
+          session_id
+        );
+
+        if (!checkoutSession) {
+          return res.status(404).send({
+            success: false,
+            message: "checkout session not found",
+          });
+        }
+
+        if (checkoutSession.payment_status !== "paid") {
+          return res.status(400).send({
+            success: false,
+            message: "payment is not completed yet",
+          });
+        }
+
+        const metadata = checkoutSession.metadata || {};
+        const ebookId = metadata.ebookId;
+        const userEmail = metadata.userEmail;
+        const writerEmail = metadata.writerEmail;
+
+        if (!ebookId || !userEmail) {
+          return res.status(400).send({
+            success: false,
+            message: "payment metadata is missing",
+          });
+        }
+
+        if (!ObjectId.isValid(ebookId)) {
+          return res.status(400).send({
+            success: false,
+            message: "invalid ebook id",
+          });
+        }
+
+        const ebook = await ebooksCollection.findOne({
+          _id: new ObjectId(ebookId),
+        });
+
+        if (!ebook) {
+          return res.status(404).send({
+            success: false,
+            message: "ebook not found",
+          });
+        }
+
+        // prevent duplicate database update if user refreshes success page
+        const existingTransaction = await transactionsCollection.findOne({
+          stripeSessionId: session_id,
+        });
+
+        if (existingTransaction) {
+          return res.send({
+            success: true,
+            alreadyProcessed: true,
+            message: "purchase already saved",
+            ebookId,
+            ebookTitle: existingTransaction.ebookTitle,
+            amount: existingTransaction.amount,
+            transactionId: existingTransaction.transactionId,
+          });
+        }
+
+        const transactionId =
+          checkoutSession.payment_intent || checkoutSession.id;
+
+        const purchaseDate = new Date();
+
+        const transaction = {
+          stripeSessionId: session_id,
+          transactionId,
+          type: "purchase",
+          ebookId,
+          ebookTitle: ebook.title,
+          coverImage: ebook.coverImage,
+          buyerEmail: userEmail,
+          writerEmail: writerEmail || ebook.writerEmail,
+          writerName: ebook.writerName,
+          amount: Number(ebook.price),
+          currency: checkoutSession.currency || "usd",
+          status: "paid",
+          paymentStatus: checkoutSession.payment_status,
+          purchaseDate,
+          createdAt: purchaseDate,
+        };
+
+        await transactionsCollection.insertOne(transaction);
+
+        await usersCollection.updateOne(
+          { email: userEmail },
+          {
+            $setOnInsert: {
+              email: userEmail,
+              customer_email: userEmail,
+              role: "user",
+              createdAt: purchaseDate,
+            },
+            $addToSet: {
+              purchasedEbooks: ebookId,
+            },
+            $push: {
+              purchaseHistory: {
+                ebookId,
+                ebookTitle: ebook.title,
+                writerEmail: writerEmail || ebook.writerEmail,
+                writerName: ebook.writerName,
+                price: Number(ebook.price),
+                transactionId,
+                status: "paid",
+                purchaseDate,
+              },
+            },
+          },
+          { upsert: true }
+        );
+
+        await ebooksCollection.updateOne(
+          { _id: new ObjectId(ebookId) },
+          {
+            $inc: { totalSales: 1 },
+            $set: { updatedAt: purchaseDate },
+          }
+        );
+
+        res.send({
+          success: true,
+          message: "purchase saved successfully",
+          ebookId,
+          ebookTitle: ebook.title,
+          amount: Number(ebook.price),
+          transactionId,
+        });
+      } catch (err) {
+        res.status(500).send({
+          success: false,
+          message: "failed to verify payment",
+          error: err.message,
+        });
+      }
+    });
+
+    // ==========================================
     // admin action: get all ebooks for administrative console
     // ==========================================
-    app.get('/api/admin/ebooks', async (req, res) => {
+    app.get("/api/admin/ebooks", async (req, res) => {
       try {
         const cursor = ebooksCollection.find();
         const result = await cursor.toArray();
         res.send(result);
       } catch (error) {
-        res.status(500).send({ message: "failed to fetch admin ebooks data", error: error.message });
+        res.status(500).send({
+          message: "failed to fetch admin ebooks data",
+          error: error.message,
+        });
       }
     });
 
     // ==========================================
-    // admin action: get dashboard overview analytics 
+    // admin action: get dashboard overview analytics
     // ==========================================
-    app.get('/api/admin/analytics-overview', async (req, res) => {
+    app.get("/api/admin/analytics-overview", async (req, res) => {
       try {
         const totalUsers = await usersCollection.countDocuments();
         const totalEbooks = await ebooksCollection.countDocuments();
-        
-        const totalSoldBooks = 0; 
-        const totalRevenue = 0;
 
-        res.send({ totalUsers, totalEbooks, totalSoldBooks, totalRevenue });
+        const totalSoldBooks = await transactionsCollection.countDocuments({
+          type: "purchase",
+          status: "paid",
+        });
+
+        const revenueData = await transactionsCollection
+          .aggregate([
+            {
+              $match: {
+                type: "purchase",
+                status: "paid",
+              },
+            },
+            {
+              $group: {
+                _id: null,
+                totalRevenue: { $sum: "$amount" },
+              },
+            },
+          ])
+          .toArray();
+
+        const totalRevenue = revenueData[0]?.totalRevenue || 0;
+
+        res.send({
+          totalUsers,
+          totalEbooks,
+          totalSoldBooks,
+          totalRevenue,
+        });
       } catch (error) {
-        res.status(500).send({ message: "failed to load admin stats", error: error.message });
+        res.status(500).send({
+          message: "failed to load admin stats",
+          error: error.message,
+        });
       }
     });
 
     // ==========================================
     // admin action: get all general users
     // ==========================================
-    app.get('/api/users', async (req, res) => {
+    app.get("/api/users", async (req, res) => {
       try {
         const result = await usersCollection.find().toArray();
         res.send(result);
       } catch (error) {
-        res.status(500).send({ message: "failed to load users", error: error.message });
+        res.status(500).send({
+          message: "failed to load users",
+          error: error.message,
+        });
       }
     });
 
