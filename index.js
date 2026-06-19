@@ -445,20 +445,20 @@ async function run() {
       }
     });
 
-    // ==========================================
-    // admin action: get all general users
-    // ==========================================
-    app.get("/api/users", async (req, res) => {
-      try {
-        const result = await usersCollection.find().toArray();
-        res.send(result);
-      } catch (error) {
-        res.status(500).send({
-          message: "failed to load users",
-          error: error.message,
-        });
-      }
-    });
+    // // ==========================================
+    // // admin action: get all general users
+    // // ==========================================
+    // app.get("/api/users", async (req, res) => {
+    //   try {
+    //     const result = await usersCollection.find().toArray();
+    //     res.send(result);
+    //   } catch (error) {
+    //     res.status(500).send({
+    //       message: "failed to load users",
+    //       error: error.message,
+    //     });
+    //   }
+    // });
 
     await client.db("admin").command({ ping: 1 });
     console.log("mongodb connected successfully");
