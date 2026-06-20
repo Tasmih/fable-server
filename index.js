@@ -43,9 +43,9 @@ async function run() {
     const ebooksCollection = database.collection("ebooks");
     const transactionsCollection = database.collection("transactions");
 
-    // ==========================================
+  
     // client action: get all published ebooks for browse store
-    // ==========================================
+
     app.get("/api/ebooks", async (req, res) => {
       try {
         const {
@@ -168,9 +168,9 @@ async function run() {
       }
     });
 
-    // ==========================================
+    
     // client action: create new ebook record
-    // ==========================================
+
     app.post("/api/ebooks", async (req, res) => {
       try {
         const ebook = req.body;
@@ -207,9 +207,9 @@ async function run() {
       }
     });
 
-    // ==========================================
+
     // client action: get single ebook data by unique id
-    // ==========================================
+  
     app.get("/api/ebooks/:id", async (req, res) => {
       try {
         const id = req.params.id;
@@ -269,69 +269,143 @@ async function run() {
       }
     });
 
-    // ==========================================
-    // client action: add ebook to bookmark
-    // ==========================================
-    app.post("/api/users/bookmark/:ebookId", async (req, res) => {
-      try {
-        const { ebookId } = req.params;
-        const { email } = req.query;
 
-        if (!email) {
-          return res.status(400).send({ message: "email is required" });
-        }
+// user action: get bookmarked ebooks
 
-        const result = await usersCollection.updateOne(
-          { email },
-          { $addToSet: { bookmarks: ebookId } }
-        );
+app.get("/api/users/bookmarks", async (req, res) => {
+  try {
+    const email = req.query.email?.toLowerCase()?.trim();
 
-        res.send({
-          success: true,
-          message: "ebook bookmarked",
-          result,
-        });
-      } catch (err) {
-        res.status(500).send({
-          message: "failed to bookmark ebook",
-          error: err.message,
-        });
-      }
+    if (!email) {
+      return res.status(400).send({ message: "email is required" });
+    }
+
+    const user = await usersCollection.findOne({ email });
+
+    if (!user || !user.bookmarks || user.bookmarks.length === 0) {
+      return res.send([]);
+    }
+
+    const bookmarkIds = user.bookmarks || [];
+
+    const objectIds = bookmarkIds
+      .filter((id) => ObjectId.isValid(id))
+      .map((id) => new ObjectId(id));
+
+    if (objectIds.length === 0) {
+      return res.send([]);
+    }
+
+    const ebooks = await ebooksCollection
+      .find({ _id: { $in: objectIds } })
+      .project({ fullContent: 0 })
+      .toArray();
+
+    const ebookMap = new Map(
+      ebooks.map((ebook) => [ebook._id.toString(), ebook])
+    );
+
+    const sortedBookmarks = bookmarkIds
+      .map((id) => ebookMap.get(id))
+      .filter(Boolean)
+      .reverse();
+
+    res.send(sortedBookmarks);
+  } catch (err) {
+    res.status(500).send({
+      message: "failed to load bookmarks",
+      error: err.message,
+    });
+  }
+});
+
+
+// user action: add ebook to bookmark
+
+app.post("/api/users/bookmark/:ebookId", async (req, res) => {
+  try {
+    const { ebookId } = req.params;
+    const email = req.query.email?.toLowerCase()?.trim();
+
+    if (!email) {
+      return res.status(400).send({ message: "email is required" });
+    }
+
+    if (!ObjectId.isValid(ebookId)) {
+      return res.status(400).send({ message: "invalid ebook id" });
+    }
+
+    const ebook = await ebooksCollection.findOne({
+      _id: new ObjectId(ebookId),
     });
 
-    // ==========================================
-    // client action: remove ebook from bookmark
-    // ==========================================
-    app.delete("/api/users/bookmark/:ebookId", async (req, res) => {
-      try {
-        const { ebookId } = req.params;
-        const { email } = req.query;
+    if (!ebook) {
+      return res.status(404).send({ message: "ebook not found" });
+    }
 
-        if (!email) {
-          return res.status(400).send({ message: "email is required" });
-        }
+    const result = await usersCollection.updateOne(
+      { email },
+      {
+        $setOnInsert: {
+          email,
+          name: req.body?.name || "",
+          role: "user",
+          purchasedEbooks: [],
+          createdAt: new Date(),
+        },
+        $addToSet: { bookmarks: ebookId },
+      },
+      { upsert: true }
+    );
 
-        const result = await usersCollection.updateOne(
-          { email },
-          { $pull: { bookmarks: ebookId } }
-        );
-
-        res.send({
-          success: true,
-          message: "bookmark removed",
-          result,
-        });
-      } catch (err) {
-        res.status(500).send({
-          message: "failed to remove bookmark",
-          error: err.message,
-        });
-      }
+    res.send({
+      success: true,
+      bookmarked: true,
+      message: "ebook bookmarked",
+      result,
     });
+  } catch (err) {
+    console.error("Bookmark add error:", err);
 
-    // ==========================================
+    res.status(500).send({
+      message: "failed to bookmark ebook",
+      error: err.message,
+    });
+  }
+});
+
+
+// user action: remove ebook from bookmark
+
+app.delete("/api/users/bookmark/:ebookId", async (req, res) => {
+  try {
+    const { ebookId } = req.params;
+    const email = req.query.email?.toLowerCase()?.trim();
+
+    if (!email) {
+      return res.status(400).send({ message: "email is required" });
+    }
+
+    const result = await usersCollection.updateOne(
+      { email },
+      { $pull: { bookmarks: ebookId } }
+    );
+
+    res.send({
+      success: true,
+      bookmarked: false,
+      message: "bookmark removed",
+      result,
+    });
+  } catch (err) {
+    res.status(500).send({
+      message: "failed to remove bookmark",
+      error: err.message,
+    });
+  }
+});
     // payment action: create stripe checkout session
-    // ==========================================
+    
     app.post("/api/payment/create-checkout", async (req, res) => {
       try {
         if (!stripe) {
@@ -410,9 +484,9 @@ async function run() {
       }
     });
 
-    // ==========================================
+
     // payment action: verify stripe payment and save purchase
-    // ==========================================
+
     app.get("/api/payment/success", async (req, res) => {
       try {
         if (!stripe) {
@@ -574,9 +648,9 @@ async function run() {
       }
     });
 
-    // ==========================================
+ 
     // user action: get purchased ebooks
-    // ==========================================
+  
     app.get("/api/users/purchased-ebooks", async (req, res) => {
       try {
         const { email } = req.query;
@@ -649,9 +723,8 @@ async function run() {
       }
     });
 
-    // ==========================================
     // user action: get purchase history
-    // ==========================================
+
     app.get("/api/users/purchase-history", async (req, res) => {
       try {
         const { email } = req.query;
@@ -677,9 +750,9 @@ async function run() {
       }
     });
 
-    // ==========================================
+
     // admin action: get all ebooks for administrative console
-    // ==========================================
+  
     app.get("/api/admin/ebooks", async (req, res) => {
       try {
         const cursor = ebooksCollection.find();
@@ -693,9 +766,9 @@ async function run() {
       }
     });
 
-    // ==========================================
+  
     // admin action: get dashboard overview analytics
-    // ==========================================
+    
     app.get("/api/admin/analytics-overview", async (req, res) => {
       try {
         const totalUsers = await usersCollection.countDocuments();
@@ -739,9 +812,9 @@ async function run() {
       }
     });
 
-    // ==========================================
+   
     // admin action: get all general users
-    // ==========================================
+    
     app.get("/api/users", async (req, res) => {
       try {
         const result = await usersCollection.find().toArray();
