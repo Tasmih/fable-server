@@ -17,8 +17,26 @@ const stripe = process.env.STRIPE_SECRET_KEY
   ? require("stripe")(process.env.STRIPE_SECRET_KEY)
   : null;
 
-app.use(cors());
-app.use(express.json());
+// cors setup
+const allowedOrigins = [
+  process.env.CLIENT_URL,
+  "http://localhost:3000",
+].filter(Boolean);
+
+app.use(
+  cors({
+    origin(origin, callback) {
+      if (!origin || allowedOrigins.includes(origin)) {
+        return callback(null, true);
+      }
+
+      return callback(new Error("not allowed by cors"));
+    },
+    credentials: true,
+  })
+);
+
+app.use(express.json({ limit: "10mb" }));
 
 app.get("/", (req, res) => {
   res.send("Fable server is running");
@@ -34,6 +52,11 @@ const client = new MongoClient(uri, {
   },
 });
 
+// helper action: normalize email
+const normalizeEmail = (email) => {
+  return email?.toString()?.toLowerCase()?.trim();
+};
+
 async function run() {
   try {
     await client.connect();
@@ -43,9 +66,7 @@ async function run() {
     const ebooksCollection = database.collection("ebooks");
     const transactionsCollection = database.collection("transactions");
 
-  
     // client action: get all published ebooks for browse store
-
     app.get("/api/ebooks", async (req, res) => {
       try {
         const {
@@ -60,6 +81,7 @@ async function run() {
           email,
         } = req.query;
 
+        const userEmail = normalizeEmail(email);
         const andConditions = [];
 
         // only published ebooks will show on public browse page
@@ -91,13 +113,13 @@ async function run() {
         let purchasedIds = [];
 
         // find purchased ebook ids for logged in user
-        if (email) {
-          const user = await usersCollection.findOne({ email });
+        if (userEmail) {
+          const user = await usersCollection.findOne({ email: userEmail });
           purchasedIds = user?.purchasedEbooks || [];
         }
 
         // user purchased ebooks
-        if (availability === "sold" && email) {
+        if (availability === "sold" && userEmail) {
           if (purchasedIds.length === 0) {
             return res.send({
               ebooks: [],
@@ -117,7 +139,7 @@ async function run() {
         }
 
         // user not purchased ebooks
-        if (availability === "in_stock" && email && purchasedIds.length > 0) {
+        if (availability === "in_stock" && userEmail && purchasedIds.length > 0) {
           const objectIds = purchasedIds
             .filter((id) => ObjectId.isValid(id))
             .map((id) => new ObjectId(id));
@@ -168,9 +190,7 @@ async function run() {
       }
     });
 
-    
     // client action: create new ebook record
-
     app.post("/api/ebooks", async (req, res) => {
       try {
         const ebook = req.body;
@@ -183,7 +203,7 @@ async function run() {
           genre: ebook.genre,
           coverImage: ebook.coverImage,
           writerName: ebook.writerName,
-          writerEmail: ebook.writerEmail,
+          writerEmail: normalizeEmail(ebook.writerEmail),
           writerId: ebook.writerId || "",
           status: ebook.status || "published",
           totalSales: 0,
@@ -207,13 +227,11 @@ async function run() {
       }
     });
 
-
     // client action: get single ebook data by unique id
-  
     app.get("/api/ebooks/:id", async (req, res) => {
       try {
         const id = req.params.id;
-        const { email } = req.query;
+        const email = normalizeEmail(req.query.email);
 
         if (!ObjectId.isValid(id)) {
           return res.status(400).send({ message: "invalid ebook id" });
@@ -269,143 +287,216 @@ async function run() {
       }
     });
 
+    // user action: get user profile
+    app.get("/api/users/profile", async (req, res) => {
+      try {
+        const email = normalizeEmail(req.query.email);
 
-// user action: get bookmarked ebooks
+        if (!email) {
+          return res.status(400).send({ message: "email is required" });
+        }
 
-app.get("/api/users/bookmarks", async (req, res) => {
-  try {
-    const email = req.query.email?.toLowerCase()?.trim();
+        const user = await usersCollection.findOne({ email });
 
-    if (!email) {
-      return res.status(400).send({ message: "email is required" });
-    }
+        if (!user) {
+          return res.status(404).send({ message: "user not found" });
+        }
 
-    const user = await usersCollection.findOne({ email });
-
-    if (!user || !user.bookmarks || user.bookmarks.length === 0) {
-      return res.send([]);
-    }
-
-    const bookmarkIds = user.bookmarks || [];
-
-    const objectIds = bookmarkIds
-      .filter((id) => ObjectId.isValid(id))
-      .map((id) => new ObjectId(id));
-
-    if (objectIds.length === 0) {
-      return res.send([]);
-    }
-
-    const ebooks = await ebooksCollection
-      .find({ _id: { $in: objectIds } })
-      .project({ fullContent: 0 })
-      .toArray();
-
-    const ebookMap = new Map(
-      ebooks.map((ebook) => [ebook._id.toString(), ebook])
-    );
-
-    const sortedBookmarks = bookmarkIds
-      .map((id) => ebookMap.get(id))
-      .filter(Boolean)
-      .reverse();
-
-    res.send(sortedBookmarks);
-  } catch (err) {
-    res.status(500).send({
-      message: "failed to load bookmarks",
-      error: err.message,
-    });
-  }
-});
-
-
-// user action: add ebook to bookmark
-
-app.post("/api/users/bookmark/:ebookId", async (req, res) => {
-  try {
-    const { ebookId } = req.params;
-    const email = req.query.email?.toLowerCase()?.trim();
-
-    if (!email) {
-      return res.status(400).send({ message: "email is required" });
-    }
-
-    if (!ObjectId.isValid(ebookId)) {
-      return res.status(400).send({ message: "invalid ebook id" });
-    }
-
-    const ebook = await ebooksCollection.findOne({
-      _id: new ObjectId(ebookId),
+        res.send(user);
+      } catch (err) {
+        res.status(500).send({
+          message: "failed to load profile",
+          error: err.message,
+        });
+      }
     });
 
-    if (!ebook) {
-      return res.status(404).send({ message: "ebook not found" });
-    }
+    // user action: update user profile
+    app.patch("/api/users/profile", async (req, res) => {
+      try {
+        const email = normalizeEmail(req.query.email);
+        const { name, image } = req.body;
 
-    const result = await usersCollection.updateOne(
-      { email },
-      {
-        $setOnInsert: {
-          email,
-          name: req.body?.name || "",
-          role: "user",
-          purchasedEbooks: [],
-          createdAt: new Date(),
-        },
-        $addToSet: { bookmarks: ebookId },
-      },
-      { upsert: true }
-    );
+        if (!email) {
+          return res.status(400).send({ message: "email is required" });
+        }
 
-    res.send({
-      success: true,
-      bookmarked: true,
-      message: "ebook bookmarked",
-      result,
+        const updateDoc = {
+          updatedAt: new Date(),
+        };
+
+        if (name?.trim()) {
+          updateDoc.name = name.trim();
+        }
+
+        if (image?.trim()) {
+          updateDoc.image = image.trim();
+        }
+
+        const result = await usersCollection.updateOne(
+          { email },
+          {
+            $set: updateDoc,
+            $setOnInsert: {
+              email,
+              role: "user",
+              purchasedEbooks: [],
+              bookmarks: [],
+              purchaseHistory: [],
+              createdAt: new Date(),
+            },
+          },
+          { upsert: true }
+        );
+
+        const updatedUser = await usersCollection.findOne({ email });
+
+        res.send({
+          success: true,
+          message: "profile updated successfully",
+          result,
+          user: updatedUser,
+        });
+      } catch (err) {
+        res.status(500).send({
+          message: "failed to update profile",
+          error: err.message,
+        });
+      }
     });
-  } catch (err) {
-    console.error("Bookmark add error:", err);
 
-    res.status(500).send({
-      message: "failed to bookmark ebook",
-      error: err.message,
+    // user action: get bookmarked ebooks
+    app.get("/api/users/bookmarks", async (req, res) => {
+      try {
+        const email = normalizeEmail(req.query.email);
+
+        if (!email) {
+          return res.status(400).send({ message: "email is required" });
+        }
+
+        const user = await usersCollection.findOne({ email });
+
+        if (!user || !user.bookmarks || user.bookmarks.length === 0) {
+          return res.send([]);
+        }
+
+        const bookmarkIds = user.bookmarks || [];
+
+        const objectIds = bookmarkIds
+          .filter((id) => ObjectId.isValid(id))
+          .map((id) => new ObjectId(id));
+
+        if (objectIds.length === 0) {
+          return res.send([]);
+        }
+
+        const ebooks = await ebooksCollection
+          .find({ _id: { $in: objectIds } })
+          .project({ fullContent: 0 })
+          .toArray();
+
+        const ebookMap = new Map(
+          ebooks.map((ebook) => [ebook._id.toString(), ebook])
+        );
+
+        const sortedBookmarks = bookmarkIds
+          .map((id) => ebookMap.get(id))
+          .filter(Boolean)
+          .reverse();
+
+        res.send(sortedBookmarks);
+      } catch (err) {
+        res.status(500).send({
+          message: "failed to load bookmarks",
+          error: err.message,
+        });
+      }
     });
-  }
-});
 
+    // user action: add ebook to bookmark
+    app.post("/api/users/bookmark/:ebookId", async (req, res) => {
+      try {
+        const { ebookId } = req.params;
+        const email = normalizeEmail(req.query.email);
 
-// user action: remove ebook from bookmark
+        if (!email) {
+          return res.status(400).send({ message: "email is required" });
+        }
 
-app.delete("/api/users/bookmark/:ebookId", async (req, res) => {
-  try {
-    const { ebookId } = req.params;
-    const email = req.query.email?.toLowerCase()?.trim();
+        if (!ObjectId.isValid(ebookId)) {
+          return res.status(400).send({ message: "invalid ebook id" });
+        }
 
-    if (!email) {
-      return res.status(400).send({ message: "email is required" });
-    }
+        const ebook = await ebooksCollection.findOne({
+          _id: new ObjectId(ebookId),
+        });
 
-    const result = await usersCollection.updateOne(
-      { email },
-      { $pull: { bookmarks: ebookId } }
-    );
+        if (!ebook) {
+          return res.status(404).send({ message: "ebook not found" });
+        }
 
-    res.send({
-      success: true,
-      bookmarked: false,
-      message: "bookmark removed",
-      result,
+        const result = await usersCollection.updateOne(
+          { email },
+          {
+            $setOnInsert: {
+              email,
+              name: req.body?.name || "",
+              role: "user",
+              purchasedEbooks: [],
+              purchaseHistory: [],
+              createdAt: new Date(),
+            },
+            $addToSet: { bookmarks: ebookId },
+          },
+          { upsert: true }
+        );
+
+        res.send({
+          success: true,
+          bookmarked: true,
+          message: "ebook bookmarked",
+          result,
+        });
+      } catch (err) {
+        console.error("bookmark add error:", err);
+
+        res.status(500).send({
+          message: "failed to bookmark ebook",
+          error: err.message,
+        });
+      }
     });
-  } catch (err) {
-    res.status(500).send({
-      message: "failed to remove bookmark",
-      error: err.message,
+
+    // user action: remove ebook from bookmark
+    app.delete("/api/users/bookmark/:ebookId", async (req, res) => {
+      try {
+        const { ebookId } = req.params;
+        const email = normalizeEmail(req.query.email);
+
+        if (!email) {
+          return res.status(400).send({ message: "email is required" });
+        }
+
+        const result = await usersCollection.updateOne(
+          { email },
+          { $pull: { bookmarks: ebookId } }
+        );
+
+        res.send({
+          success: true,
+          bookmarked: false,
+          message: "bookmark removed",
+          result,
+        });
+      } catch (err) {
+        res.status(500).send({
+          message: "failed to remove bookmark",
+          error: err.message,
+        });
+      }
     });
-  }
-});
+
     // payment action: create stripe checkout session
-    
     app.post("/api/payment/create-checkout", async (req, res) => {
       try {
         if (!stripe) {
@@ -415,8 +506,9 @@ app.delete("/api/users/bookmark/:ebookId", async (req, res) => {
         }
 
         const { ebookId, userEmail } = req.body;
+        const email = normalizeEmail(userEmail);
 
-        if (!ebookId || !userEmail) {
+        if (!ebookId || !email) {
           return res.status(400).send({
             message: "ebookId and userEmail are required",
           });
@@ -435,13 +527,13 @@ app.delete("/api/users/bookmark/:ebookId", async (req, res) => {
         }
 
         // writer cannot buy own ebook
-        if (ebook.writerEmail === userEmail) {
+        if (ebook.writerEmail === email) {
           return res.status(400).send({
             message: "you cannot purchase your own ebook",
           });
         }
 
-        const user = await usersCollection.findOne({ email: userEmail });
+        const user = await usersCollection.findOne({ email });
 
         if (user?.purchasedEbooks?.includes(ebookId)) {
           return res.status(400).send({
@@ -451,7 +543,7 @@ app.delete("/api/users/bookmark/:ebookId", async (req, res) => {
 
         const session = await stripe.checkout.sessions.create({
           payment_method_types: ["card"],
-          customer_email: userEmail,
+          customer_email: email,
           line_items: [
             {
               price_data: {
@@ -470,7 +562,7 @@ app.delete("/api/users/bookmark/:ebookId", async (req, res) => {
           cancel_url: `${process.env.CLIENT_URL}/ebooks/${ebookId}`,
           metadata: {
             ebookId,
-            userEmail,
+            userEmail: email,
             writerEmail: ebook.writerEmail,
           },
         });
@@ -484,9 +576,7 @@ app.delete("/api/users/bookmark/:ebookId", async (req, res) => {
       }
     });
 
-
     // payment action: verify stripe payment and save purchase
-
     app.get("/api/payment/success", async (req, res) => {
       try {
         if (!stripe) {
@@ -525,8 +615,8 @@ app.delete("/api/users/bookmark/:ebookId", async (req, res) => {
 
         const metadata = checkoutSession.metadata || {};
         const ebookId = metadata.ebookId;
-        const userEmail = metadata.userEmail;
-        const writerEmail = metadata.writerEmail;
+        const userEmail = normalizeEmail(metadata.userEmail);
+        const writerEmail = normalizeEmail(metadata.writerEmail);
 
         if (!ebookId || !userEmail) {
           return res.status(400).send({
@@ -602,6 +692,7 @@ app.delete("/api/users/bookmark/:ebookId", async (req, res) => {
               email: userEmail,
               customer_email: userEmail,
               role: "user",
+              bookmarks: [],
               createdAt: purchaseDate,
             },
             $addToSet: {
@@ -648,12 +739,10 @@ app.delete("/api/users/bookmark/:ebookId", async (req, res) => {
       }
     });
 
- 
     // user action: get purchased ebooks
-  
     app.get("/api/users/purchased-ebooks", async (req, res) => {
       try {
-        const { email } = req.query;
+        const email = normalizeEmail(req.query.email);
 
         if (!email) {
           return res.status(400).send({ message: "email is required" });
@@ -724,10 +813,9 @@ app.delete("/api/users/bookmark/:ebookId", async (req, res) => {
     });
 
     // user action: get purchase history
-
     app.get("/api/users/purchase-history", async (req, res) => {
       try {
-        const { email } = req.query;
+        const email = normalizeEmail(req.query.email);
 
         if (!email) {
           return res.status(400).send({ message: "email is required" });
@@ -750,9 +838,7 @@ app.delete("/api/users/bookmark/:ebookId", async (req, res) => {
       }
     });
 
-
     // admin action: get all ebooks for administrative console
-  
     app.get("/api/admin/ebooks", async (req, res) => {
       try {
         const cursor = ebooksCollection.find();
@@ -766,9 +852,7 @@ app.delete("/api/users/bookmark/:ebookId", async (req, res) => {
       }
     });
 
-  
     // admin action: get dashboard overview analytics
-    
     app.get("/api/admin/analytics-overview", async (req, res) => {
       try {
         const totalUsers = await usersCollection.countDocuments();
@@ -812,9 +896,7 @@ app.delete("/api/users/bookmark/:ebookId", async (req, res) => {
       }
     });
 
-   
     // admin action: get all general users
-    
     app.get("/api/users", async (req, res) => {
       try {
         const result = await usersCollection.find().toArray();
