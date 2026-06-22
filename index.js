@@ -65,7 +65,54 @@ async function run() {
     const usersCollection = database.collection("user");
     const ebooksCollection = database.collection("ebooks");
     const transactionsCollection = database.collection("transactions");
+    const sessionCollection = database.collection("session");
 
+ // verify token
+const verifyToken = async (req, res, next) => {
+  try {
+    const authHeader = req.headers?.authorization;
+
+    if (!authHeader) {
+      return res.status(401).send({ message: "unauthorized access" });
+    }
+
+    const token = authHeader.split(" ")[1];
+
+    if (!token) {
+      return res.status(401).send({ message: "unauthorized access" });
+    }
+
+    const session = await sessionCollection.findOne({ token });
+
+    if (!session) {
+      return res.status(401).send({ message: "invalid session" });
+    }
+
+    if (session.expiresAt && new Date(session.expiresAt) < new Date()) {
+      return res.status(401).send({ message: "session expired" });
+    }
+
+    if (!ObjectId.isValid(session.userId)) {
+      return res.status(401).send({ message: "invalid session user" });
+    }
+
+    const user = await usersCollection.findOne({
+      _id: new ObjectId(session.userId),
+    });
+
+    if (!user) {
+      return res.status(401).send({ message: "unauthorized access" });
+    }
+
+    req.user = user;
+    next();
+  } catch (error) {
+    res.status(500).send({
+      message: "token verification failed",
+      error: error.message,
+    });
+  }
+};
     // client action: get all published ebooks for browse store
     app.get("/api/ebooks", async (req, res) => {
       try {
@@ -1343,45 +1390,34 @@ async function run() {
       }
     });
 
-   /* =========================
-   ADMIN ROUTES
-========================= */
+  
+  // ADMIN ROUTES
 
-// ADMIN ROLE CHECK
+// admin role check
 const verifyAdmin = async (req, res, next) => {
-  try {
-    const email = normalizeEmail(
-      req.query.email || req.body.adminEmail || req.body.email
-    );
-
-    if (!email) {
-      return res.status(401).send({ message: "admin email is required" });
-    }
-
-    const admin = await usersCollection.findOne({ email });
-
-    if (!admin || admin.role !== "admin") {
-      return res.status(403).send({ message: "only admin can access this" });
-    }
-
-    next();
-  } catch (error) {
-    res.status(500).send({
-      message: "admin verification failed",
-      error: error.message,
-    });
+  if (req.user?.role !== "admin") {
+    return res.status(403).send({ message: "forbidden access" });
   }
+
+  next();
 };
 
-// ADMIN OVERVIEW
-app.get("/api/admin/overview", verifyAdmin, async (req, res) => {
+// admin overview
+app.get("/api/admin/overview", verifyToken, verifyAdmin, async (req, res) => {
   try {
     const totalUsers = await usersCollection.countDocuments();
-    const totalReaders = await usersCollection.countDocuments({ role: "user" });
+
+    const totalReaders = await usersCollection.countDocuments({
+      role: "user",
+    });
+
     const totalWriters = await usersCollection.countDocuments({
       role: "writer",
     });
-    const totalAdmins = await usersCollection.countDocuments({ role: "admin" });
+
+    const totalAdmins = await usersCollection.countDocuments({
+      role: "admin",
+    });
 
     const totalEbooks = await ebooksCollection.countDocuments({
       isDeleted: { $ne: true },
@@ -1448,8 +1484,8 @@ app.get("/api/admin/overview", verifyAdmin, async (req, res) => {
   }
 });
 
-// ADMIN USERS LIST
-app.get("/api/admin/users", verifyAdmin, async (req, res) => {
+// admin users list
+app.get("/api/admin/users", verifyToken, verifyAdmin, async (req, res) => {
   try {
     const users = await usersCollection
       .find({})
@@ -1466,83 +1502,92 @@ app.get("/api/admin/users", verifyAdmin, async (req, res) => {
   }
 });
 
-// ADMIN CHANGE USER ROLE
-app.patch("/api/admin/users/:id/role", verifyAdmin, async (req, res) => {
-  try {
-    const id = req.params.id;
-    const { role } = req.body;
+// admin change user role
+app.patch(
+  "/api/admin/users/:id/role",
+  verifyToken,
+  verifyAdmin,
+  async (req, res) => {
+    try {
+      const id = req.params.id;
+      const { role } = req.body;
 
-    if (!ObjectId.isValid(id)) {
-      return res.status(400).send({ message: "invalid user id" });
+      if (!ObjectId.isValid(id)) {
+        return res.status(400).send({ message: "invalid user id" });
+      }
+
+      const allowedRoles = ["user", "writer", "admin"];
+
+      if (!allowedRoles.includes(role)) {
+        return res.status(400).send({ message: "invalid role" });
+      }
+
+      const updateDoc = {
+        role,
+        updatedAt: new Date(),
+      };
+
+      if (role === "writer") {
+        updateDoc.writerVerified = true;
+      }
+
+      if (role === "user") {
+        updateDoc.writerVerified = false;
+      }
+
+      const result = await usersCollection.updateOne(
+        { _id: new ObjectId(id) },
+        { $set: updateDoc }
+      );
+
+      if (result.matchedCount === 0) {
+        return res.status(404).send({ message: "user not found" });
+      }
+
+      const updatedUser = await usersCollection.findOne(
+        { _id: new ObjectId(id) },
+        { projection: { password: 0 } }
+      );
+
+      res.send({
+        success: true,
+        message: "user role updated successfully",
+        user: updatedUser,
+      });
+    } catch (error) {
+      res.status(500).send({
+        message: "failed to update user role",
+        error: error.message,
+      });
     }
-
-    const allowedRoles = ["user", "writer", "admin"];
-
-    if (!allowedRoles.includes(role)) {
-      return res.status(400).send({ message: "invalid role" });
-    }
-
-    const updateDoc = {
-      role,
-      updatedAt: new Date(),
-    };
-
-    if (role === "writer") {
-      updateDoc.writerVerified = true;
-    }
-
-    if (role === "user") {
-      updateDoc.writerVerified = false;
-    }
-
-    const result = await usersCollection.updateOne(
-      { _id: new ObjectId(id) },
-      { $set: updateDoc }
-    );
-
-    if (result.matchedCount === 0) {
-      return res.status(404).send({ message: "user not found" });
-    }
-
-    const updatedUser = await usersCollection.findOne(
-      { _id: new ObjectId(id) },
-      { projection: { password: 0 } }
-    );
-
-    res.send({
-      success: true,
-      message: "user role updated successfully",
-      user: updatedUser,
-    });
-  } catch (error) {
-    res.status(500).send({
-      message: "failed to update user role",
-      error: error.message,
-    });
   }
-});
+);
 
-// ADMIN DELETE USER
-app.delete("/api/admin/users/:id", verifyAdmin, async (req, res) => {
+// admin delete user
+app.delete("/api/admin/users/:id", verifyToken, verifyAdmin, async (req, res) => {
   try {
     const id = req.params.id;
-    const adminEmail = normalizeEmail(req.query.email);
+    const adminEmail = normalizeEmail(req.user?.email);
 
     if (!ObjectId.isValid(id)) {
       return res.status(400).send({ message: "invalid user id" });
     }
 
-    const user = await usersCollection.findOne({ _id: new ObjectId(id) });
+    const user = await usersCollection.findOne({
+      _id: new ObjectId(id),
+    });
 
     if (!user) {
       return res.status(404).send({ message: "user not found" });
     }
 
-    if (user.email === adminEmail) {
+    if (normalizeEmail(user.email) === adminEmail) {
       return res.status(400).send({ message: "you cannot delete yourself" });
     }
 
-    const result = await usersCollection.deleteOne({ _id: new ObjectId(id) });
+    const result = await usersCollection.deleteOne({
+      _id: new ObjectId(id),
+    });
 
     res.send({
       success: true,
@@ -1557,8 +1602,8 @@ app.delete("/api/admin/users/:id", verifyAdmin, async (req, res) => {
   }
 });
 
-// ADMIN ALL EBOOKS
-app.get("/api/admin/ebooks", verifyAdmin, async (req, res) => {
+// admin all ebooks
+app.get("/api/admin/ebooks", verifyToken, verifyAdmin, async (req, res) => {
   try {
     const ebooks = await ebooksCollection
       .find({
@@ -1577,53 +1622,58 @@ app.get("/api/admin/ebooks", verifyAdmin, async (req, res) => {
   }
 });
 
-// ADMIN PUBLISH OR UNPUBLISH EBOOK
-app.patch("/api/admin/ebooks/:id/status", verifyAdmin, async (req, res) => {
-  try {
-    const id = req.params.id;
-    const { status } = req.body;
+// admin publish or unpublish ebook
+app.patch(
+  "/api/admin/ebooks/:id/status",
+  verifyToken,
+  verifyAdmin,
+  async (req, res) => {
+    try {
+      const id = req.params.id;
+      const { status } = req.body;
 
-    if (!ObjectId.isValid(id)) {
-      return res.status(400).send({ message: "invalid ebook id" });
-    }
-
-    if (!["published", "unpublished"].includes(status)) {
-      return res.status(400).send({ message: "invalid ebook status" });
-    }
-
-    const result = await ebooksCollection.updateOne(
-      { _id: new ObjectId(id) },
-      {
-        $set: {
-          status,
-          updatedAt: new Date(),
-        },
+      if (!ObjectId.isValid(id)) {
+        return res.status(400).send({ message: "invalid ebook id" });
       }
-    );
 
-    if (result.matchedCount === 0) {
-      return res.status(404).send({ message: "ebook not found" });
+      if (!["published", "unpublished"].includes(status)) {
+        return res.status(400).send({ message: "invalid ebook status" });
+      }
+
+      const result = await ebooksCollection.updateOne(
+        { _id: new ObjectId(id) },
+        {
+          $set: {
+            status,
+            updatedAt: new Date(),
+          },
+        }
+      );
+
+      if (result.matchedCount === 0) {
+        return res.status(404).send({ message: "ebook not found" });
+      }
+
+      const updatedEbook = await ebooksCollection.findOne({
+        _id: new ObjectId(id),
+      });
+
+      res.send({
+        success: true,
+        message: `ebook ${status} successfully`,
+        ebook: updatedEbook,
+      });
+    } catch (error) {
+      res.status(500).send({
+        message: "failed to update ebook status",
+        error: error.message,
+      });
     }
-
-    const updatedEbook = await ebooksCollection.findOne({
-      _id: new ObjectId(id),
-    });
-
-    res.send({
-      success: true,
-      message: `ebook ${status} successfully`,
-      ebook: updatedEbook,
-    });
-  } catch (error) {
-    res.status(500).send({
-      message: "failed to update ebook status",
-      error: error.message,
-    });
   }
-});
+);
 
-// ADMIN DELETE EBOOK
-app.delete("/api/admin/ebooks/:id", verifyAdmin, async (req, res) => {
+// admin delete ebook
+app.delete("/api/admin/ebooks/:id", verifyToken, verifyAdmin, async (req, res) => {
   try {
     const id = req.params.id;
 
@@ -1652,25 +1702,30 @@ app.delete("/api/admin/ebooks/:id", verifyAdmin, async (req, res) => {
   }
 });
 
-// ADMIN ALL TRANSACTIONS
-app.get("/api/admin/transactions", verifyAdmin, async (req, res) => {
-  try {
-    const transactions = await transactionsCollection
-      .find({})
-      .sort({ createdAt: -1 })
-      .toArray();
+// admin all transactions
+app.get(
+  "/api/admin/transactions",
+  verifyToken,
+  verifyAdmin,
+  async (req, res) => {
+    try {
+      const transactions = await transactionsCollection
+        .find({})
+        .sort({ createdAt: -1 })
+        .toArray();
 
-    res.send(transactions);
-  } catch (error) {
-    res.status(500).send({
-      message: "failed to load transactions",
-      error: error.message,
-    });
+      res.send(transactions);
+    } catch (error) {
+      res.status(500).send({
+        message: "failed to load transactions",
+        error: error.message,
+      });
+    }
   }
-});
+);
 
-// ADMIN ANALYTICS
-app.get("/api/admin/analytics", verifyAdmin, async (req, res) => {
+// admin analytics
+app.get("/api/admin/analytics", verifyToken, verifyAdmin, async (req, res) => {
   try {
     const transactions = await transactionsCollection.find({}).toArray();
 
