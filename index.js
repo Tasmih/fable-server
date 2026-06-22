@@ -190,41 +190,12 @@ async function run() {
       }
     });
 
-    // client action: create new ebook record
+    // client action: block direct ebook create route
     app.post("/api/ebooks", async (req, res) => {
-      try {
-        const ebook = req.body;
-
-        const newEbook = {
-          title: ebook.title,
-          description: ebook.description,
-          fullContent: ebook.fullContent,
-          price: Number(ebook.price),
-          genre: ebook.genre,
-          coverImage: ebook.coverImage,
-          writerName: ebook.writerName,
-          writerEmail: normalizeEmail(ebook.writerEmail),
-          writerId: ebook.writerId || "",
-          status: ebook.status || "published",
-          totalSales: 0,
-          createdAt: new Date(),
-        };
-
-        const result = await ebooksCollection.insertOne(newEbook);
-
-        res.status(201).send({
-          success: true,
-          message: "ebook created successfully",
-          insertedId: result.insertedId,
-          ebook: newEbook,
-        });
-      } catch (err) {
-        res.status(500).send({
-          success: false,
-          message: "failed to create ebook",
-          error: err.message,
-        });
-      }
+      res.status(403).send({
+        success: false,
+        message: "please use writer dashboard to create ebooks",
+      });
     });
 
     // client action: get single ebook data by unique id
@@ -491,6 +462,540 @@ async function run() {
       } catch (err) {
         res.status(500).send({
           message: "failed to remove bookmark",
+          error: err.message,
+        });
+      }
+    });
+
+    // writer action: get writer dashboard overview
+    app.get("/api/writer/overview", async (req, res) => {
+      try {
+        const email = normalizeEmail(req.query.email);
+
+        if (!email) {
+          return res.status(400).send({ message: "email is required" });
+        }
+
+        const writer = await usersCollection.findOne({ email });
+
+        const totalEbooks = await ebooksCollection.countDocuments({
+          writerEmail: email,
+        });
+
+        const publishedEbooks = await ebooksCollection.countDocuments({
+          writerEmail: email,
+          status: "published",
+        });
+
+        const unpublishedEbooks = await ebooksCollection.countDocuments({
+          writerEmail: email,
+          status: "unpublished",
+        });
+
+        const sales = await transactionsCollection
+          .find({
+            writerEmail: email,
+            type: "purchase",
+            status: "paid",
+          })
+          .sort({ createdAt: -1 })
+          .toArray();
+
+        const totalRevenue = sales.reduce(
+          (sum, item) => sum + Number(item.amount || 0),
+          0
+        );
+
+        const recentEbooks = await ebooksCollection
+          .find({ writerEmail: email })
+          .project({ fullContent: 0 })
+          .sort({ createdAt: -1 })
+          .limit(5)
+          .toArray();
+
+        res.send({
+          writer: writer || null,
+          writerVerified: writer?.writerVerified || false,
+          totalEbooks,
+          publishedEbooks,
+          unpublishedEbooks,
+          totalSales: sales.length,
+          totalRevenue,
+          recentEbooks,
+          recentSales: sales.slice(0, 5),
+        });
+      } catch (err) {
+        res.status(500).send({
+          message: "failed to load writer overview",
+          error: err.message,
+        });
+      }
+    });
+
+    // writer action: get own ebooks
+    app.get("/api/writer/ebooks", async (req, res) => {
+      try {
+        const email = normalizeEmail(req.query.email);
+
+        if (!email) {
+          return res.status(400).send({ message: "email is required" });
+        }
+
+        const ebooks = await ebooksCollection
+          .find({ writerEmail: email })
+          .project({ fullContent: 0 })
+          .sort({ createdAt: -1 })
+          .toArray();
+
+        res.send(ebooks);
+      } catch (err) {
+        res.status(500).send({
+          message: "failed to load writer ebooks",
+          error: err.message,
+        });
+      }
+    });
+
+    // writer action: add new ebook
+    app.post("/api/writer/ebooks", async (req, res) => {
+      try {
+        const ebook = req.body;
+        const writerEmail = normalizeEmail(ebook.writerEmail);
+
+        if (!writerEmail) {
+          return res.status(400).send({ message: "writer email is required" });
+        }
+
+        const writer = await usersCollection.findOne({ email: writerEmail });
+
+        if (!writer) {
+          return res.status(404).send({ message: "writer account not found" });
+        }
+
+        if (writer.role !== "writer" && writer.role !== "admin") {
+          return res.status(403).send({
+            message: "only writers can add ebooks",
+          });
+        }
+
+        if (!writer.writerVerified) {
+          return res.status(403).send({
+            message: "please complete writer verification payment first",
+          });
+        }
+
+        if (
+          !ebook.title ||
+          !ebook.description ||
+          !ebook.fullContent ||
+          !ebook.price ||
+          !ebook.genre ||
+          !ebook.coverImage
+        ) {
+          return res.status(400).send({
+            message: "all ebook fields are required",
+          });
+        }
+
+        const newEbook = {
+          title: ebook.title.trim(),
+          description: ebook.description.trim(),
+          fullContent: ebook.fullContent.trim(),
+          price: Number(ebook.price),
+          genre: ebook.genre,
+          coverImage: ebook.coverImage,
+          writerName: ebook.writerName || writer.name || "unknown writer",
+          writerEmail,
+          writerId: ebook.writerId || "",
+          status: ebook.status || "published",
+          totalSales: 0,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        };
+
+        const result = await ebooksCollection.insertOne(newEbook);
+
+        res.status(201).send({
+          success: true,
+          message: "ebook added successfully",
+          insertedId: result.insertedId,
+          ebook: newEbook,
+        });
+      } catch (err) {
+        res.status(500).send({
+          message: "failed to add ebook",
+          error: err.message,
+        });
+      }
+    });
+
+    // writer action: get single own ebook
+    app.get("/api/writer/ebooks/:id", async (req, res) => {
+      try {
+        const id = req.params.id;
+        const email = normalizeEmail(req.query.email);
+
+        if (!email) {
+          return res.status(400).send({ message: "email is required" });
+        }
+
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).send({ message: "invalid ebook id" });
+        }
+
+        const ebook = await ebooksCollection.findOne({
+          _id: new ObjectId(id),
+          writerEmail: email,
+        });
+
+        if (!ebook) {
+          return res.status(404).send({ message: "ebook not found" });
+        }
+
+        res.send(ebook);
+      } catch (err) {
+        res.status(500).send({
+          message: "failed to load ebook",
+          error: err.message,
+        });
+      }
+    });
+
+    // writer action: update own ebook
+    app.patch("/api/writer/ebooks/:id", async (req, res) => {
+      try {
+        const id = req.params.id;
+        const email = normalizeEmail(req.query.email);
+        const ebook = req.body;
+
+        if (!email) {
+          return res.status(400).send({ message: "email is required" });
+        }
+
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).send({ message: "invalid ebook id" });
+        }
+
+        const updateDoc = {
+          title: ebook.title?.trim(),
+          description: ebook.description?.trim(),
+          fullContent: ebook.fullContent?.trim(),
+          price: Number(ebook.price),
+          genre: ebook.genre,
+          coverImage: ebook.coverImage,
+          status: ebook.status || "published",
+          updatedAt: new Date(),
+        };
+
+        const result = await ebooksCollection.updateOne(
+          {
+            _id: new ObjectId(id),
+            writerEmail: email,
+          },
+          {
+            $set: updateDoc,
+          }
+        );
+
+        if (result.matchedCount === 0) {
+          return res.status(404).send({ message: "ebook not found" });
+        }
+
+        res.send({
+          success: true,
+          message: "ebook updated successfully",
+          result,
+        });
+      } catch (err) {
+        res.status(500).send({
+          message: "failed to update ebook",
+          error: err.message,
+        });
+      }
+    });
+
+    // writer action: publish or unpublish own ebook
+    app.patch("/api/writer/ebooks/:id/status", async (req, res) => {
+      try {
+        const id = req.params.id;
+        const email = normalizeEmail(req.query.email);
+        const { status } = req.body;
+
+        if (!email) {
+          return res.status(400).send({ message: "email is required" });
+        }
+
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).send({ message: "invalid ebook id" });
+        }
+
+        if (!["published", "unpublished"].includes(status)) {
+          return res.status(400).send({ message: "invalid ebook status" });
+        }
+
+        const result = await ebooksCollection.updateOne(
+          {
+            _id: new ObjectId(id),
+            writerEmail: email,
+          },
+          {
+            $set: {
+              status,
+              updatedAt: new Date(),
+            },
+          }
+        );
+
+        if (result.matchedCount === 0) {
+          return res.status(404).send({ message: "ebook not found" });
+        }
+
+        res.send({
+          success: true,
+          message: `ebook ${status} successfully`,
+          result,
+        });
+      } catch (err) {
+        res.status(500).send({
+          message: "failed to update ebook status",
+          error: err.message,
+        });
+      }
+    });
+
+    // writer action: delete own ebook
+    app.delete("/api/writer/ebooks/:id", async (req, res) => {
+      try {
+        const id = req.params.id;
+        const email = normalizeEmail(req.query.email);
+
+        if (!email) {
+          return res.status(400).send({ message: "email is required" });
+        }
+
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).send({ message: "invalid ebook id" });
+        }
+
+        const result = await ebooksCollection.deleteOne({
+          _id: new ObjectId(id),
+          writerEmail: email,
+        });
+
+        if (result.deletedCount === 0) {
+          return res.status(404).send({ message: "ebook not found" });
+        }
+
+        res.send({
+          success: true,
+          message: "ebook deleted successfully",
+          result,
+        });
+      } catch (err) {
+        res.status(500).send({
+          message: "failed to delete ebook",
+          error: err.message,
+        });
+      }
+    });
+
+    // writer action: get sales history
+    app.get("/api/writer/sales-history", async (req, res) => {
+      try {
+        const email = normalizeEmail(req.query.email);
+
+        if (!email) {
+          return res.status(400).send({ message: "email is required" });
+        }
+
+        const sales = await transactionsCollection
+          .find({
+            writerEmail: email,
+            type: "purchase",
+            status: "paid",
+          })
+          .sort({ createdAt: -1 })
+          .toArray();
+
+        const buyerEmails = [...new Set(sales.map((item) => item.buyerEmail))];
+
+        const buyers = await usersCollection
+          .find({ email: { $in: buyerEmails } })
+          .toArray();
+
+        const buyerMap = new Map(
+          buyers.map((buyer) => [buyer.email, buyer.name || buyer.email])
+        );
+
+        const formattedSales = sales.map((item) => ({
+          ...item,
+          buyerName: buyerMap.get(item.buyerEmail) || item.buyerEmail,
+        }));
+
+        res.send(formattedSales);
+      } catch (err) {
+        res.status(500).send({
+          message: "failed to load sales history",
+          error: err.message,
+        });
+      }
+    });
+
+    // writer action: create verification checkout
+    app.post("/api/writer/verification/create-checkout", async (req, res) => {
+      try {
+        if (!stripe) {
+          return res.status(500).send({
+            message: "stripe secret key is missing",
+          });
+        }
+
+        const email = normalizeEmail(req.body.email);
+
+        if (!email) {
+          return res.status(400).send({ message: "email is required" });
+        }
+
+        const writer = await usersCollection.findOne({ email });
+
+        if (!writer) {
+          return res.status(404).send({ message: "writer account not found" });
+        }
+
+        if (writer.writerVerified) {
+          return res.status(400).send({ message: "writer already verified" });
+        }
+
+        const verificationFee = Number(process.env.WRITER_VERIFICATION_FEE || 10);
+
+        const session = await stripe.checkout.sessions.create({
+          payment_method_types: ["card"],
+          customer_email: email,
+          line_items: [
+            {
+              price_data: {
+                currency: "usd",
+                product_data: {
+                  name: "Fable Writer Verification Fee",
+                },
+                unit_amount: Math.round(verificationFee * 100),
+              },
+              quantity: 1,
+            },
+          ],
+          mode: "payment",
+          success_url: `${process.env.CLIENT_URL}/dashboard/writer/verify/success?session_id={CHECKOUT_SESSION_ID}`,
+          cancel_url: `${process.env.CLIENT_URL}/dashboard/writer/verify`,
+          metadata: {
+            type: "publishing_fee",
+            writerEmail: email,
+          },
+        });
+
+        res.send({ url: session.url });
+      } catch (err) {
+        res.status(500).send({
+          message: "failed to create writer verification checkout",
+          error: err.message,
+        });
+      }
+    });
+
+    // writer action: verify writer payment and update writer
+    app.get("/api/writer/verification/success", async (req, res) => {
+      try {
+        if (!stripe) {
+          return res.status(500).send({
+            success: false,
+            message: "stripe secret key is missing",
+          });
+        }
+
+        const { session_id } = req.query;
+
+        if (!session_id) {
+          return res.status(400).send({
+            success: false,
+            message: "session id is required",
+          });
+        }
+
+        const checkoutSession = await stripe.checkout.sessions.retrieve(
+          session_id
+        );
+
+        if (!checkoutSession) {
+          return res.status(404).send({
+            success: false,
+            message: "checkout session not found",
+          });
+        }
+
+        if (checkoutSession.payment_status !== "paid") {
+          return res.status(400).send({
+            success: false,
+            message: "payment is not completed yet",
+          });
+        }
+
+        const writerEmail = normalizeEmail(checkoutSession.metadata?.writerEmail);
+
+        if (!writerEmail) {
+          return res.status(400).send({
+            success: false,
+            message: "writer email missing from metadata",
+          });
+        }
+
+        const existingTransaction = await transactionsCollection.findOne({
+          stripeSessionId: session_id,
+        });
+
+        if (existingTransaction) {
+          return res.send({
+            success: true,
+            alreadyProcessed: true,
+            message: "writer verification already saved",
+          });
+        }
+
+        const amount = Number(checkoutSession.amount_total || 0) / 100;
+        const paymentDate = new Date();
+
+        await transactionsCollection.insertOne({
+          stripeSessionId: session_id,
+          transactionId: checkoutSession.payment_intent || checkoutSession.id,
+          type: "publishing_fee",
+          writerEmail,
+          userEmail: writerEmail,
+          amount,
+          currency: checkoutSession.currency || "usd",
+          status: "paid",
+          paymentStatus: checkoutSession.payment_status,
+          createdAt: paymentDate,
+          purchaseDate: paymentDate,
+        });
+
+        await usersCollection.updateOne(
+          { email: writerEmail },
+          {
+            $set: {
+              role: "writer",
+              writerVerified: true,
+              writerVerifiedAt: paymentDate,
+              updatedAt: paymentDate,
+            },
+          }
+        );
+
+        res.send({
+          success: true,
+          message: "writer verified successfully",
+        });
+      } catch (err) {
+        res.status(500).send({
+          success: false,
+          message: "failed to verify writer payment",
           error: err.message,
         });
       }
@@ -838,76 +1343,414 @@ async function run() {
       }
     });
 
-    // admin action: get all ebooks for administrative console
-    app.get("/api/admin/ebooks", async (req, res) => {
-      try {
-        const cursor = ebooksCollection.find();
-        const result = await cursor.toArray();
-        res.send(result);
-      } catch (error) {
-        res.status(500).send({
-          message: "failed to fetch admin ebooks data",
-          error: error.message,
-        });
-      }
+   /* =========================
+   ADMIN ROUTES
+========================= */
+
+// ADMIN ROLE CHECK
+const verifyAdmin = async (req, res, next) => {
+  try {
+    const email = normalizeEmail(
+      req.query.email || req.body.adminEmail || req.body.email
+    );
+
+    if (!email) {
+      return res.status(401).send({ message: "admin email is required" });
+    }
+
+    const admin = await usersCollection.findOne({ email });
+
+    if (!admin || admin.role !== "admin") {
+      return res.status(403).send({ message: "only admin can access this" });
+    }
+
+    next();
+  } catch (error) {
+    res.status(500).send({
+      message: "admin verification failed",
+      error: error.message,
+    });
+  }
+};
+
+// ADMIN OVERVIEW
+app.get("/api/admin/overview", verifyAdmin, async (req, res) => {
+  try {
+    const totalUsers = await usersCollection.countDocuments();
+    const totalReaders = await usersCollection.countDocuments({ role: "user" });
+    const totalWriters = await usersCollection.countDocuments({
+      role: "writer",
+    });
+    const totalAdmins = await usersCollection.countDocuments({ role: "admin" });
+
+    const totalEbooks = await ebooksCollection.countDocuments({
+      isDeleted: { $ne: true },
     });
 
-    // admin action: get dashboard overview analytics
-    app.get("/api/admin/analytics-overview", async (req, res) => {
-      try {
-        const totalUsers = await usersCollection.countDocuments();
-        const totalEbooks = await ebooksCollection.countDocuments();
-
-        const totalSoldBooks = await transactionsCollection.countDocuments({
-          type: "purchase",
-          status: "paid",
-        });
-
-        const revenueData = await transactionsCollection
-          .aggregate([
-            {
-              $match: {
-                type: "purchase",
-                status: "paid",
-              },
-            },
-            {
-              $group: {
-                _id: null,
-                totalRevenue: { $sum: "$amount" },
-              },
-            },
-          ])
-          .toArray();
-
-        const totalRevenue = revenueData[0]?.totalRevenue || 0;
-
-        res.send({
-          totalUsers,
-          totalEbooks,
-          totalSoldBooks,
-          totalRevenue,
-        });
-      } catch (error) {
-        res.status(500).send({
-          message: "failed to load admin stats",
-          error: error.message,
-        });
-      }
+    const publishedEbooks = await ebooksCollection.countDocuments({
+      status: "published",
+      isDeleted: { $ne: true },
     });
 
-    // admin action: get all general users
-    app.get("/api/users", async (req, res) => {
-      try {
-        const result = await usersCollection.find().toArray();
-        res.send(result);
-      } catch (error) {
-        res.status(500).send({
-          message: "failed to load users",
-          error: error.message,
-        });
-      }
+    const unpublishedEbooks = await ebooksCollection.countDocuments({
+      status: "unpublished",
+      isDeleted: { $ne: true },
     });
+
+    const transactions = await transactionsCollection
+      .find({})
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    const totalTransactions = transactions.length;
+
+    const totalRevenue = transactions.reduce((sum, item) => {
+      return sum + Number(item.amount || item.price || 0);
+    }, 0);
+
+    const purchaseTransactions = transactions.filter((item) => {
+      return item.type === "purchase" && item.status === "paid";
+    });
+
+    const totalSold = purchaseTransactions.length;
+
+    const recentTransactions = transactions.slice(0, 5).map((item) => ({
+      _id: item._id,
+      transactionId: item.transactionId || item.stripeSessionId || "",
+      type: item.type || "purchase",
+      userEmail: item.userEmail || item.buyerEmail || "",
+      buyerEmail: item.buyerEmail || "",
+      writerEmail: item.writerEmail || "",
+      ebookTitle: item.ebookTitle || "N/A",
+      amount: Number(item.amount || item.price || 0),
+      status: item.status || "paid",
+      createdAt: item.createdAt || item.purchaseDate,
+    }));
+
+    res.send({
+      totalUsers,
+      totalReaders,
+      totalWriters,
+      totalAdmins,
+      totalEbooks,
+      publishedEbooks,
+      unpublishedEbooks,
+      totalTransactions,
+      totalRevenue,
+      totalSold,
+      recentTransactions,
+    });
+  } catch (error) {
+    res.status(500).send({
+      message: "failed to load admin overview",
+      error: error.message,
+    });
+  }
+});
+
+// ADMIN USERS LIST
+app.get("/api/admin/users", verifyAdmin, async (req, res) => {
+  try {
+    const users = await usersCollection
+      .find({})
+      .project({ password: 0 })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    res.send(users);
+  } catch (error) {
+    res.status(500).send({
+      message: "failed to load users",
+      error: error.message,
+    });
+  }
+});
+
+// ADMIN CHANGE USER ROLE
+app.patch("/api/admin/users/:id/role", verifyAdmin, async (req, res) => {
+  try {
+    const id = req.params.id;
+    const { role } = req.body;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).send({ message: "invalid user id" });
+    }
+
+    const allowedRoles = ["user", "writer", "admin"];
+
+    if (!allowedRoles.includes(role)) {
+      return res.status(400).send({ message: "invalid role" });
+    }
+
+    const updateDoc = {
+      role,
+      updatedAt: new Date(),
+    };
+
+    if (role === "writer") {
+      updateDoc.writerVerified = true;
+    }
+
+    if (role === "user") {
+      updateDoc.writerVerified = false;
+    }
+
+    const result = await usersCollection.updateOne(
+      { _id: new ObjectId(id) },
+      { $set: updateDoc }
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).send({ message: "user not found" });
+    }
+
+    const updatedUser = await usersCollection.findOne(
+      { _id: new ObjectId(id) },
+      { projection: { password: 0 } }
+    );
+
+    res.send({
+      success: true,
+      message: "user role updated successfully",
+      user: updatedUser,
+    });
+  } catch (error) {
+    res.status(500).send({
+      message: "failed to update user role",
+      error: error.message,
+    });
+  }
+});
+
+// ADMIN DELETE USER
+app.delete("/api/admin/users/:id", verifyAdmin, async (req, res) => {
+  try {
+    const id = req.params.id;
+    const adminEmail = normalizeEmail(req.query.email);
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).send({ message: "invalid user id" });
+    }
+
+    const user = await usersCollection.findOne({ _id: new ObjectId(id) });
+
+    if (!user) {
+      return res.status(404).send({ message: "user not found" });
+    }
+
+    if (user.email === adminEmail) {
+      return res.status(400).send({ message: "you cannot delete yourself" });
+    }
+
+    const result = await usersCollection.deleteOne({ _id: new ObjectId(id) });
+
+    res.send({
+      success: true,
+      message: "user deleted successfully",
+      result,
+    });
+  } catch (error) {
+    res.status(500).send({
+      message: "failed to delete user",
+      error: error.message,
+    });
+  }
+});
+
+// ADMIN ALL EBOOKS
+app.get("/api/admin/ebooks", verifyAdmin, async (req, res) => {
+  try {
+    const ebooks = await ebooksCollection
+      .find({
+        isDeleted: { $ne: true },
+      })
+      .project({ fullContent: 0 })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    res.send(ebooks);
+  } catch (error) {
+    res.status(500).send({
+      message: "failed to load admin ebooks",
+      error: error.message,
+    });
+  }
+});
+
+// ADMIN PUBLISH OR UNPUBLISH EBOOK
+app.patch("/api/admin/ebooks/:id/status", verifyAdmin, async (req, res) => {
+  try {
+    const id = req.params.id;
+    const { status } = req.body;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).send({ message: "invalid ebook id" });
+    }
+
+    if (!["published", "unpublished"].includes(status)) {
+      return res.status(400).send({ message: "invalid ebook status" });
+    }
+
+    const result = await ebooksCollection.updateOne(
+      { _id: new ObjectId(id) },
+      {
+        $set: {
+          status,
+          updatedAt: new Date(),
+        },
+      }
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).send({ message: "ebook not found" });
+    }
+
+    const updatedEbook = await ebooksCollection.findOne({
+      _id: new ObjectId(id),
+    });
+
+    res.send({
+      success: true,
+      message: `ebook ${status} successfully`,
+      ebook: updatedEbook,
+    });
+  } catch (error) {
+    res.status(500).send({
+      message: "failed to update ebook status",
+      error: error.message,
+    });
+  }
+});
+
+// ADMIN DELETE EBOOK
+app.delete("/api/admin/ebooks/:id", verifyAdmin, async (req, res) => {
+  try {
+    const id = req.params.id;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).send({ message: "invalid ebook id" });
+    }
+
+    const result = await ebooksCollection.deleteOne({
+      _id: new ObjectId(id),
+    });
+
+    if (result.deletedCount === 0) {
+      return res.status(404).send({ message: "ebook not found" });
+    }
+
+    res.send({
+      success: true,
+      message: "ebook deleted successfully",
+      result,
+    });
+  } catch (error) {
+    res.status(500).send({
+      message: "failed to delete ebook",
+      error: error.message,
+    });
+  }
+});
+
+// ADMIN ALL TRANSACTIONS
+app.get("/api/admin/transactions", verifyAdmin, async (req, res) => {
+  try {
+    const transactions = await transactionsCollection
+      .find({})
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    res.send(transactions);
+  } catch (error) {
+    res.status(500).send({
+      message: "failed to load transactions",
+      error: error.message,
+    });
+  }
+});
+
+// ADMIN ANALYTICS
+app.get("/api/admin/analytics", verifyAdmin, async (req, res) => {
+  try {
+    const transactions = await transactionsCollection.find({}).toArray();
+
+    const monthlySalesMap = {};
+
+    transactions.forEach((item) => {
+      const date = item.createdAt || item.purchaseDate || new Date();
+
+      const month = new Date(date).toLocaleString("en-US", {
+        month: "short",
+        year: "numeric",
+      });
+
+      if (!monthlySalesMap[month]) {
+        monthlySalesMap[month] = 0;
+      }
+
+      monthlySalesMap[month] += Number(item.amount || item.price || 0);
+    });
+
+    const monthlySales = Object.keys(monthlySalesMap).map((month) => ({
+      month,
+      revenue: monthlySalesMap[month],
+    }));
+
+    const genreData = await ebooksCollection
+      .aggregate([
+        {
+          $match: {
+            isDeleted: { $ne: true },
+          },
+        },
+        {
+          $group: {
+            _id: "$genre",
+            count: { $sum: 1 },
+          },
+        },
+        {
+          $project: {
+            _id: 0,
+            genre: "$_id",
+            count: 1,
+          },
+        },
+      ])
+      .toArray();
+
+    const paymentTypeData = await transactionsCollection
+      .aggregate([
+        {
+          $group: {
+            _id: "$type",
+            count: { $sum: 1 },
+            revenue: { $sum: "$amount" },
+          },
+        },
+        {
+          $project: {
+            _id: 0,
+            type: "$_id",
+            count: 1,
+            revenue: 1,
+          },
+        },
+      ])
+      .toArray();
+
+    res.send({
+      monthlySales,
+      genreData,
+      paymentTypeData,
+    });
+  } catch (error) {
+    res.status(500).send({
+      message: "failed to load admin analytics",
+      error: error.message,
+    });
+  }
+});
 
     await client.db("admin").command({ ping: 1 });
     console.log("mongodb connected successfully");
