@@ -67,6 +67,117 @@ async function run() {
     const transactionsCollection = database.collection("transactions");
     const sessionCollection = database.collection("session");
 
+
+    // TOP WRITERS - public home section
+app.get("/api/top-writers", async (req, res) => {
+  try {
+    const limit = Number(req.query.limit) || 3;
+
+    const transactions = await transactionsCollection.find({}).toArray();
+
+    const ebooks = await ebooksCollection
+      .find({})
+      .project({
+        writerEmail: 1,
+        writerName: 1,
+        title: 1,
+      })
+      .toArray();
+
+    const ebookMap = new Map();
+
+    ebooks.forEach((ebook) => {
+      ebookMap.set(ebook._id.toString(), ebook);
+    });
+
+    const salesMap = new Map();
+
+    transactions.forEach((transaction) => {
+      const status = String(transaction.status || "").toLowerCase();
+
+      if (
+        status.includes("failed") ||
+        status.includes("cancel") ||
+        status.includes("refunded")
+      ) {
+        return;
+      }
+
+      const ebookId =
+        transaction.ebookId ||
+        transaction.bookId ||
+        transaction.productId ||
+        transaction.ebook?._id;
+
+      const ebook = ebookId ? ebookMap.get(String(ebookId)) : null;
+
+      const writerEmail =
+        transaction.writerEmail ||
+        transaction.writer?.email ||
+        ebook?.writerEmail;
+
+      const writerName =
+        transaction.writerName ||
+        transaction.writer?.name ||
+        ebook?.writerName ||
+        "Writer";
+
+      if (!writerEmail) return;
+
+      const existing = salesMap.get(writerEmail) || {
+        email: writerEmail,
+        name: writerName,
+        sales: 0,
+      };
+
+      existing.sales += 1;
+
+      salesMap.set(writerEmail, existing);
+    });
+
+    const writerEmails = Array.from(salesMap.keys());
+
+    const writers = await usersCollection
+      .find({
+        email: { $in: writerEmails },
+      })
+      .project({
+        name: 1,
+        email: 1,
+        image: 1,
+        role: 1,
+      })
+      .toArray();
+
+    const writerProfileMap = new Map();
+
+    writers.forEach((writer) => {
+      writerProfileMap.set(writer.email, writer);
+    });
+
+    const topWriters = Array.from(salesMap.values())
+      .map((item) => {
+        const profile = writerProfileMap.get(item.email) || {};
+
+        return {
+          name: profile.name || item.name || "Writer",
+          email: item.email,
+          image: profile.image || "",
+          sales: item.sales,
+        };
+      })
+      .sort((a, b) => b.sales - a.sales)
+      .slice(0, limit);
+
+    res.json(topWriters);
+  } catch (error) {
+    res.status(500).json({
+      message: "Failed to load top writers",
+      error: error.message,
+    });
+  }
+});
+
  // verify token
 const verifyToken = async (req, res, next) => {
   try {
@@ -132,8 +243,10 @@ const verifyToken = async (req, res, next) => {
         const andConditions = [];
 
         // only published ebooks will show on public browse page
-        andConditions.push({ status: "published" });
-
+        andConditions.push({
+           status: "published",
+            isDeleted: { $ne: true },
+               });
         // search by title or writer name
         if (search) {
           andConditions.push({
@@ -237,13 +350,107 @@ const verifyToken = async (req, res, next) => {
       }
     });
 
-    // client action: block direct ebook create route
-    app.post("/api/ebooks", async (req, res) => {
-      res.status(403).send({
-        success: false,
-        message: "please use writer dashboard to create ebooks",
+    // client action: create ebook using old client route
+// This keeps old frontend createEbook() working
+app.post("/api/ebooks", async (req, res) => {
+  try {
+    const ebook = req.body;
+    const writerEmail = normalizeEmail(ebook.writerEmail);
+
+    if (!writerEmail) {
+      return res.status(400).send({ message: "writer email is required" });
+    }
+
+    const writer = await usersCollection.findOne({ email: writerEmail });
+
+    if (!writer) {
+      return res.status(404).send({ message: "writer account not found" });
+    }
+
+    if (writer.role !== "writer" && writer.role !== "admin") {
+      return res.status(403).send({
+        message: "only writers can add ebooks",
       });
+    }
+
+    if (!writer.writerVerified) {
+      return res.status(403).send({
+        message: "please complete writer verification payment first",
+      });
+    }
+
+    if (
+      !ebook.title ||
+      !ebook.description ||
+      !ebook.fullContent ||
+      !ebook.price ||
+      !ebook.genre ||
+      !ebook.coverImage
+    ) {
+      return res.status(400).send({
+        message: "all ebook fields are required",
+      });
+    }
+
+    const newEbook = {
+      title: ebook.title.trim(),
+      description: ebook.description.trim(),
+      fullContent: ebook.fullContent.trim(),
+      price: Number(ebook.price),
+      genre: ebook.genre,
+      coverImage: ebook.coverImage,
+      writerName: ebook.writerName || writer.name || "unknown writer",
+      writerEmail,
+      writerId: ebook.writerId || "",
+      status: ebook.status || "published",
+      isDeleted: false,
+      totalSales: 0,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+
+    const result = await ebooksCollection.insertOne(newEbook);
+
+    res.status(201).send({
+      success: true,
+      message: "ebook added successfully",
+      insertedId: result.insertedId,
+      ebook: newEbook,
     });
+  } catch (err) {
+    res.status(500).send({
+      message: "failed to create ebook",
+      error: err.message,
+    });
+  }
+});
+    // client action: get writer own ebooks using old client route
+// IMPORTANT: This route must be before  /api/ebooks/:id route-otherwise  Express will give error . "my-ebooks" কে id ধরে invalid ebook id error 
+app.get("/api/ebooks/my-ebooks", async (req, res) => {
+  try {
+    const email = normalizeEmail(req.query.email);
+
+    if (!email) {
+      return res.status(400).send({ message: "email is required" });
+    }
+
+    const ebooks = await ebooksCollection
+      .find({
+        writerEmail: email,
+        isDeleted: { $ne: true },
+      })
+      .project({ fullContent: 0 })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    res.send(ebooks);
+  } catch (err) {
+    res.status(500).send({
+      message: "failed to load my ebooks",
+      error: err.message,
+    });
+  }
+});
 
     // client action: get single ebook data by unique id
     app.get("/api/ebooks/:id", async (req, res) => {
@@ -255,9 +462,11 @@ const verifyToken = async (req, res, next) => {
           return res.status(400).send({ message: "invalid ebook id" });
         }
 
-        const ebook = await ebooksCollection.findOne({
-          _id: new ObjectId(id),
-        });
+        // Public details page: will not show invalid id /deleted ebook 
+const ebook = await ebooksCollection.findOne({
+  _id: new ObjectId(id),
+  isDeleted: { $ne: true },
+});
 
         if (!ebook) {
           return res.status(404).send({ message: "ebook not found" });
@@ -655,6 +864,7 @@ const verifyToken = async (req, res, next) => {
           writerEmail,
           writerId: ebook.writerId || "",
           status: ebook.status || "published",
+          isDeleted: false,
           totalSales: 0,
           createdAt: new Date(),
           updatedAt: new Date(),
