@@ -2017,7 +2017,7 @@ app.get("/api/admin/analytics", verifyToken, verifyAdmin, async (req, res) => {
   }
 });
 
-    await client.db("admin").command({ ping: 1 });
+   // await client.db("admin").command({ ping: 1 });
     console.log("mongodb connected successfully");
   } catch (error) {
     console.error("mongodb connection error:", error);
